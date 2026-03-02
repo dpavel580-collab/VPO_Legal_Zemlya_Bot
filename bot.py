@@ -95,7 +95,7 @@ ABOUT_TEXT = (
 )
 
 ASK_HINT_FIRST = (
-    "Напишіть питання одним повідомленням.\n\n"
+    "Напишіть питання одним повідомленням (лише текст).\n\n"
     "Щоб відповідь була точнішою, додайте 3-5 деталей:\n"
     "1) область і місто/громада (без адреси)\n"
     "2) суть ситуації (1-3 речення)\n"
@@ -105,7 +105,7 @@ ASK_HINT_FIRST = (
     "\"Ірина. Підкажіть, будь ласка, ...\""
 )
 
-ASK_HINT_NEXT = "Опишіть наступне питання по суті - коротко, але з деталями."
+ASK_HINT_NEXT = "Опишіть наступне питання по суті (лише текст) - коротко, але з деталями."
 
 STOP_TEXT = (
     "Зрозуміло. Я зупинив діалог.\n"
@@ -126,6 +126,11 @@ EXIT_TEXT = (
 AFTER_BLOCK_TEXT = (
     f"Ви поставили {MAX_Q_PER_BLOCK} питань підряд.\n"
     "Що робимо далі?"
+)
+
+NON_TEXT_TEXT = (
+    "Я приймаю лише текстові повідомлення.\n"
+    "Будь ласка, напишіть питання текстом (без голосових, файлів чи фото)."
 )
 
 # ----------------------------
@@ -284,6 +289,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     set_menu_state(context)
     await update.message.reply_text(WELCOME_TEXT, reply_markup=KB_ONLY_START)
 
+async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # відповідаємо на будь-який не-текст
+    await update.message.reply_text(NON_TEXT_TEXT, reply_markup=KB_CHAT_ALWAYS)
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     tnorm = normalize_cmd(text)
@@ -324,8 +333,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text == BTN_CONTINUE:
         set_asking_state(context)
-        context.user_data[COUNT] = 0  # знову 5 питань
-        await update.message.reply_text("Добре. Напишіть наступне повідомлення.", reply_markup=KB_CHAT_ALWAYS)
+        context.user_data[COUNT] = 0
+        await update.message.reply_text("Добре. Напишіть наступне повідомлення (текстом).", reply_markup=KB_CHAT_ALWAYS)
         return
 
     if text == BTN_NEW_Q:
@@ -357,7 +366,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     input_msgs = [{"role": "system", "content": sys_prompt}] + context.user_data[HISTORY]
 
     try:
-        # <-- як "було спочатку": одразу показати typing (без пульсу)
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
         resp = client.responses.create(
@@ -390,8 +398,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # команди
     app.add_handler(CommandHandler("start", start_cmd))
+
+    # ТЕКСТ
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # ВСЕ ІНШЕ (голосові/файли/фото/стікери/гео/контакти/відео тощо)
+    non_text_filter = (
+        filters.VOICE
+        | filters.AUDIO
+        | filters.Document.ALL
+        | filters.PHOTO
+        | filters.VIDEO
+        | filters.VIDEO_NOTE
+        | filters.STICKER
+        | filters.CONTACT
+        | filters.LOCATION
+        | filters.ANIMATION
+    )
+    app.add_handler(MessageHandler(non_text_filter, handle_non_text))
+
     app.run_polling()
 
 if __name__ == "__main__":
