@@ -130,7 +130,7 @@ AFTER_BLOCK_TEXT = (
 
 NON_TEXT_TEXT = (
     "Я приймаю лише текстові повідомлення.\n"
-    "Будь ласка, напишіть питання текстом (без голосових, файлів чи фото)."
+    "Будь ласка, напишіть питання текстом (без голосових, файлів, фото чи відео)."
 )
 
 # ----------------------------
@@ -290,7 +290,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(WELCOME_TEXT, reply_markup=KB_ONLY_START)
 
 async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # відповідаємо на будь-який не-текст
+    # будь-який не-текст (voice/photo/file/sticker/location/тощо)
     await update.message.reply_text(NON_TEXT_TEXT, reply_markup=KB_CHAT_ALWAYS)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -348,7 +348,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # якщо не в режимі питань
     if mode != "asking":
-        await update.message.reply_text(f"Натисніть \"{BTN_ASK}\" або \"{BTN_ABOUT}\".", reply_markup=KB_MAIN_TWO)
+        await update.message.reply_text(
+            f"Натисніть \"{BTN_ASK}\" або \"{BTN_ABOUT}\".",
+            reply_markup=KB_MAIN_TWO
+        )
         return
 
     # ----- РЕЖИМ ПИТАНЬ -----
@@ -402,23 +405,11 @@ def main() -> None:
     # команди
     app.add_handler(CommandHandler("start", start_cmd))
 
-    # ТЕКСТ
+    # ТЕКСТ (питання/кнопки)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # ВСЕ ІНШЕ (голосові/файли/фото/стікери/гео/контакти/відео тощо)
-    non_text_filter = (
-        filters.VOICE
-        | filters.AUDIO
-        | filters.Document.ALL
-        | filters.PHOTO
-        | filters.VIDEO
-        | filters.VIDEO_NOTE
-        | filters.STICKER
-        | filters.CONTACT
-        | filters.LOCATION
-        | filters.ANIMATION
-    )
-    app.add_handler(MessageHandler(non_text_filter, handle_non_text))
+    # ВСЕ ІНШЕ (голосові/файли/фото/стікери/гео/контакти/тощо)
+    app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_non_text))
 
     app.run_polling()
 
