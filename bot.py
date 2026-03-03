@@ -537,7 +537,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         inc_counter(f"lawyer_request_sent:{cat}")
 
         await update.message.reply_text(
-            "Дякую. Запит передано адвокату. Очікуйте, будь ласка, зворотного зв'язку від адвоката.",
+            "Дякую. Запит передано адвокату. Очікуйте, будь ласка, зворотного зв'язку.",
             reply_markup=KB_MENU
         )
         context.user_data[MODE] = "menu"
