@@ -112,9 +112,9 @@ class DB:
         with self._conn() as con:
             with con.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO events(ts, event, meta) VALUES (%s, %s, %s::jsonb)",
-                    (_now_ts(), event, json.dumps(meta, ensure_ascii=False)),
-                )
+    "INSERT INTO events(ts, event, meta) VALUES (NOW(), %s, %s::jsonb)",
+    (event, json.dumps(meta))
+)
 
     def stats_all_time(self) -> list[dict]:
         with self._conn() as con:
