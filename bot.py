@@ -3,9 +3,15 @@ import re
 import secrets
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 
 from openai import OpenAI
 
@@ -94,7 +100,6 @@ BTN_ADV = "👨‍⚖️ ЗВ'ЯЗАТИСЯ З АДВОКАТОМ"
 BTN_STOP = "🛑 СТОП"
 BTN_EXIT = "👋 ВИЙТИ"
 
-# категорії адвокатів (показуємо лише після натискання BTN_ADV)
 BTN_CAT_MIL_PAY = "⚔️ ВІЙСЬКОВІ - ВИПЛАТИ"
 BTN_CAT_MOB = "🪖 ВІЙСЬКОВІ - МОБІЛІЗАЦІЯ/ВІДСТРОЧКИ"
 BTN_CAT_CIVIL = "🏛 ЦИВІЛЬНІ - СОЦ/ПЕНСІЇ/КОМПЕНСАЦІЇ"
@@ -253,6 +258,13 @@ def kb_after_contacts():
         resize_keyboard=True
     )
 
+# Inline кнопка для адвоката (callback)
+def ikb_lawyer_contact(cat: str, client_id: int) -> InlineKeyboardMarkup:
+    data = f"CONTACT|{cat}|{client_id}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✉️ ЗВ'ЯЗАТИСЯ З КЛІЄНТОМ", callback_data=data)]
+    ])
+
 # ----------------------------
 # STATE
 # ----------------------------
@@ -300,6 +312,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(f"СТАТИСТИКА ЗА {data['days']} ДНІВ")
     lines.append(f"УНІКАЛЬНІ КОРИСТУВАЧІ (ЗА ПОДІЯМИ): {data['unique_users']}")
     lines.append("")
+
     lines.append("ПИТАННЯ (КІЛЬКІСТЬ):")
     for c in [CAT_MOB, CAT_MIL_PAY, CAT_CIVIL]:
         lines.append(f"- {c}: {get(data['asked_question'], c)}")
@@ -315,12 +328,17 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"- {c}: {get(data['request_click'], c)}")
 
     lines.append("")
-    lines.append("ЗАПИТ ВІДПРАВЛЕНО (ФАКТ):")
+    lines.append("ЗАПИТ ВІДПРАВЛЕНО АДВОКАТУ (ФАКТ):")
     for c in [CAT_MOB, CAT_MIL_PAY, CAT_CIVIL]:
         sent = get(data['request_sent'], c)
         click = get(data['request_click'], c)
         conv = (sent / click * 100) if click else 0.0
         lines.append(f"- {c}: {sent} (КОНВЕРСІЯ {conv:.1f}%)")
+
+    lines.append("")
+    lines.append("АДВОКАТ НАТИСНУВ 'ЗВ'ЯЗАТИСЯ З КЛІЄНТОМ':")
+    for c in [CAT_MOB, CAT_MIL_PAY, CAT_CIVIL]:
+        lines.append(f"- {c}: {get(data.get('lawyer_contact_click', {}), c)}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -400,6 +418,41 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         pass
 
 # ----------------------------
+# CALLBACK: lawyer presses "contact client"
+# ----------------------------
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    await q.answer()
+
+    parts = q.data.split("|")
+    if len(parts) != 3 or parts[0] != "CONTACT":
+        return
+
+    cat = parts[1]
+    try:
+        client_id = int(parts[2])
+    except ValueError:
+        return
+
+    # Логуємо: адвокат натиснув "зв'язатися"
+    lawyer_id = q.from_user.id
+    add_event(user_hash(lawyer_id), "lawyer_contact_click", cat)
+
+    # Надсилаємо адвокату посилання для відкриття приватного чату
+    # tg://user?id=... працює в Telegram-клієнтах
+    link = f"tg://user?id={client_id}"
+    msg = (
+        "ЗВ'ЯЗОК З КЛІЄНТОМ\n"
+        f"Категорія: {cat} ({CAT_LABEL.get(cat,'')})\n\n"
+        f"Натисніть посилання, щоб відкрити приватний чат:\n{link}\n\n"
+        "Якщо посилання не відкривається, клієнт міг обмежити приватні повідомлення. "
+        "Тоді попросіть клієнта написати вам напряму або використайте номер телефону з заявки."
+    )
+    await context.bot.send_message(chat_id=q.message.chat_id, text=msg)
+
+# ----------------------------
 # HANDLERS
 # ----------------------------
 async def handle_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,7 +462,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = (update.message.text or "").strip()
     low = text.lower()
 
-    # STOP / EXIT always
     if low in STOP_WORDS or text == BTN_STOP:
         context.user_data.clear()
         await update.message.reply_text(STOP_TEXT, reply_markup=KB_MAIN)
@@ -420,7 +472,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(EXIT_TEXT, reply_markup=KB_ONLY_START)
         return
 
-    # START
     if text == BTN_START:
         context.user_data.clear()
         context.user_data[MODE] = "menu"
@@ -428,17 +479,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(WELCOME_AFTER_START, reply_markup=KB_MAIN)
         return
 
-    # ABOUT
     if text == BTN_ABOUT:
         await update.message.reply_text(ABOUT_TEXT, reply_markup=KB_MAIN)
         return
 
-    # ADV menu (показуємо 3 категорії тільки після натискання BTN_ADV)
     if text == BTN_ADV:
         await update.message.reply_text("Оберіть напрямок адвоката:", reply_markup=kb_advocats())
         return
 
-    # Choose category buttons
     if text in (BTN_CAT_MIL_PAY, BTN_CAT_MOB, BTN_CAT_CIVIL):
         if text == BTN_CAT_MIL_PAY:
             cat = CAT_MIL_PAY
@@ -448,20 +496,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             cat = CAT_CIVIL
 
         context.user_data[LAST_CAT] = cat
-
         uh = user_hash(update.effective_user.id)
         add_event(uh, "pick_advocate", cat)
 
         await update.message.reply_text(contacts_text(cat), reply_markup=kb_after_contacts())
         return
 
-    # Cancel request
     if text == BTN_CANCEL:
         context.user_data[AWAIT_CAT] = None
         await update.message.reply_text("Скасовано. Можете поставити питання або звернутися до адвоката.", reply_markup=KB_MAIN)
         return
 
-    # Send request click
     if text == BTN_SEND_REQ:
         cat = context.user_data.get(LAST_CAT)
         if not cat:
@@ -479,7 +524,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(REQUEST_INSTRUCTIONS, reply_markup=KB_CHAT)
         return
 
-    # If awaiting request details: forward to lawyer (do NOT store)
     awaiting = context.user_data.get(AWAIT_CAT)
     if awaiting:
         lawyer_chat_id = get_lawyer(awaiting)
@@ -488,16 +532,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Напрямок тимчасово недоступний. Спробуйте пізніше.", reply_markup=KB_MAIN)
             return
 
+        # Формуємо payload адвокату + inline кнопку "зв'язатися"
+        client_id = update.effective_user.id
+        client_username = update.effective_user.username or ""
+        client_line = f"@{client_username}" if client_username else "(username відсутній)"
+
         payload = (
             "НОВИЙ ЗАПИТ НА ЗВОРОТНИЙ ЗВ'ЯЗОК\n"
-            f"Категорія: {awaiting} - {CAT_LABEL.get(awaiting,'')}\n\n"
+            f"Категорія: {awaiting} - {CAT_LABEL.get(awaiting,'')}\n"
+            f"Клієнт: {client_line}\n"
+            f"ID клієнта: {client_id}\n\n"
             f"{text}"
         )
 
         try:
-            await context.bot.send_message(chat_id=int(lawyer_chat_id), text=payload)
+            await context.bot.send_message(
+                chat_id=int(lawyer_chat_id),
+                text=payload,
+                reply_markup=ikb_lawyer_contact(awaiting, client_id)
+            )
             uh = user_hash(update.effective_user.id)
             add_event(uh, "request_sent", awaiting)
+
             await update.message.reply_text("Запит передано адвокату. Дякую.", reply_markup=KB_MAIN)
         except Exception:
             await update.message.reply_text("Не вдалося відправити запит. Спробуйте пізніше.", reply_markup=KB_MAIN)
@@ -505,7 +561,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data[AWAIT_CAT] = None
         return
 
-    # ASK
     if text == BTN_ASK:
         context.user_data[MODE] = "asking"
         context.user_data[COUNT] = 0
@@ -515,7 +570,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(hint, reply_markup=KB_CHAT)
         return
 
-    # Continue / New Q after block
     if text == BTN_CONTINUE:
         context.user_data[MODE] = "asking"
         context.user_data[COUNT] = 0
@@ -529,20 +583,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(ASK_HINT_NEXT, reply_markup=KB_CHAT)
         return
 
-    # If not in asking mode -> show menu
     if context.user_data.get(MODE) != "asking":
         await update.message.reply_text("Оберіть дію кнопками нижче.", reply_markup=KB_MAIN)
         return
 
     # QUESTION -> AI
-    q = text
-    cat_for_stats = detect_category(q)
+    q_text = text
+    cat_for_stats = detect_category(q_text)
 
     uh = user_hash(update.effective_user.id)
     add_event(uh, "asked_question", cat_for_stats)
 
     context.user_data.setdefault(HISTORY, [])
-    push_history(context, "user", q)
+    push_history(context, "user", q_text)
 
     input_msgs = [{"role": "system", "content": SYSTEM_PROMPT_BASE}] + context.user_data[HISTORY]
 
@@ -584,6 +637,8 @@ def main() -> None:
     app.add_handler(CommandHandler("bind", bind_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("reject", reject_cmd))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, handle_non_text))
