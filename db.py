@@ -1,17 +1,15 @@
 import os
 import json
 import hashlib
-from datetime import datetime, timezone
-
 import psycopg
 
 
 class DB:
     """
-    Privacy-first analytics DB:
-    - stores ONLY hashed user/chat identifiers (no raw IDs in analytics)
-    - auto-migrates schema safely if table already exists (older versions)
-    - lifetime stats
+    Analytics DB V2 (safe):
+    - Writes ONLY into events_v2 (new table)
+    - Ignores legacy events table (which has old NOT NULL constraints like event_type)
+    - Stores only hashed user/chat identifiers (no raw IDs)
     """
 
     def __init__(self, database_url: str, analytics_salt: str | None = None):
@@ -22,7 +20,7 @@ class DB:
         self.analytics_salt = (analytics_salt or os.getenv("ANALYTICS_SALT", "")).strip()
         self._init_db()
 
-    def _hash_id(self, raw_id: int | str | None) -> str:
+    def _hash_id(self, raw_id):
         if raw_id is None:
             raw_id = "unknown"
         base = f"{self.analytics_salt}:{raw_id}"
@@ -31,43 +29,24 @@ class DB:
     def _init_db(self):
         with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
-                # 1) Ensure table exists (minimal)
+                # NEW clean table (no legacy constraints)
                 cur.execute(
                     """
-                    CREATE TABLE IF NOT EXISTS events (
+                    CREATE TABLE IF NOT EXISTS events_v2 (
                         id BIGSERIAL PRIMARY KEY,
                         ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        user_hash TEXT,
+                        chat_hash TEXT,
                         event TEXT NOT NULL,
                         meta JSONB NOT NULL DEFAULT '{}'::jsonb
                     );
                     """
                 )
 
-                # 2) MIGRATION: add missing columns for older schemas
-                # These columns might not exist if the table was created previously.
-                cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS user_hash TEXT;")
-                cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS chat_hash TEXT;")
-
-                # Some old versions could have ts/event/meta in a different shape; we keep it safe:
-                cur.execute("ALTER TABLE events ALTER COLUMN ts SET DEFAULT NOW();")
-                cur.execute("ALTER TABLE events ALTER COLUMN meta SET DEFAULT '{}'::jsonb;")
-
-                # 3) Drop NOT NULL constraints if they exist (to prevent runtime crashes)
-                # Safe even if already nullable.
-                try:
-                    cur.execute("ALTER TABLE events ALTER COLUMN user_hash DROP NOT NULL;")
-                except Exception:
-                    pass
-                try:
-                    cur.execute("ALTER TABLE events ALTER COLUMN chat_hash DROP NOT NULL;")
-                except Exception:
-                    pass
-
-                # 4) Indexes (only after columns exist!)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_event ON events(event);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_user_hash ON events(user_hash);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_chat_hash ON events(chat_hash);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_ts ON events_v2(ts);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_event ON events_v2(event);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_user_hash ON events_v2(user_hash);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_chat_hash ON events_v2(chat_hash);")
 
             conn.commit()
 
@@ -80,7 +59,7 @@ class DB:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO events (ts, user_hash, chat_hash, event, meta)
+                    INSERT INTO events_v2 (ts, user_hash, chat_hash, event, meta)
                     VALUES (NOW(), %s, %s, %s, %s::jsonb);
                     """,
                     (uhash, chash, event, json.dumps(meta, ensure_ascii=False)),
@@ -108,19 +87,19 @@ class DB:
     def get_lifetime_stats(self) -> dict:
         with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM events;")
+                cur.execute("SELECT COUNT(*) FROM events_v2;")
                 total_events = int(cur.fetchone()[0])
 
-                cur.execute("SELECT COUNT(DISTINCT user_hash) FROM events WHERE user_hash IS NOT NULL;")
+                cur.execute("SELECT COUNT(DISTINCT user_hash) FROM events_v2 WHERE user_hash IS NOT NULL;")
                 unique_users = int(cur.fetchone()[0])
 
-                cur.execute("SELECT COUNT(DISTINCT chat_hash) FROM events WHERE chat_hash IS NOT NULL;")
+                cur.execute("SELECT COUNT(DISTINCT chat_hash) FROM events_v2 WHERE chat_hash IS NOT NULL;")
                 unique_chats = int(cur.fetchone()[0])
 
                 cur.execute(
                     """
                     SELECT event, COUNT(*) as cnt
-                    FROM events
+                    FROM events_v2
                     GROUP BY event
                     ORDER BY cnt DESC
                     LIMIT 30;
