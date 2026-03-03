@@ -1,115 +1,238 @@
 import os
-import json
 import hashlib
+from datetime import datetime, timedelta, timezone
+
 import psycopg
+from psycopg.rows import dict_row
 
 
-class DB:
+# Нові назви таблиць, щоб не конфліктувати зі старими "events"
+T_EVENTS = "events_v3"
+T_LAWYERS = "lawyer_bindings_v1"
+T_PENDING = "pending_binds_v1"
+
+
+def _db_url() -> str:
+    url = (os.getenv("DATABASE_URL", "") or "").strip()
+    if not url:
+        raise RuntimeError("Missing DATABASE_URL (Render Postgres connection string)")
+    return url
+
+
+def _salt() -> str:
+    s = (os.getenv("ANALYTICS_SALT", "") or "").strip()
+    if not s:
+        raise RuntimeError("Missing ANALYTICS_SALT")
+    return s
+
+
+def user_hash(user_id: int | str | None) -> str:
     """
-    Analytics DB V2 (safe):
-    - Writes ONLY into events_v2 (new table)
-    - Ignores legacy events table (which has old NOT NULL constraints like event_type)
-    - Stores only hashed user/chat identifiers (no raw IDs)
+    Анонімний стабільний хеш для статистики.
+    НЕ зберігаємо персональні дані.
     """
+    base = f"{_salt()}:{user_id if user_id is not None else 'unknown'}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-    def __init__(self, database_url: str, analytics_salt: str | None = None):
-        self.database_url = (database_url or "").strip()
-        if not self.database_url:
-            raise ValueError("DATABASE_URL is empty")
 
-        self.analytics_salt = (analytics_salt or os.getenv("ANALYTICS_SALT", "")).strip()
-        self._init_db()
+def _connect():
+    return psycopg.connect(_db_url(), row_factory=dict_row)
 
-    def _hash_id(self, raw_id):
-        if raw_id is None:
-            raw_id = "unknown"
-        base = f"{self.analytics_salt}:{raw_id}"
-        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-    def _init_db(self):
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                # NEW clean table (no legacy constraints)
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS events_v2 (
-                        id BIGSERIAL PRIMARY KEY,
-                        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        user_hash TEXT,
-                        chat_hash TEXT,
-                        event TEXT NOT NULL,
-                        meta JSONB NOT NULL DEFAULT '{}'::jsonb
-                    );
-                    """
-                )
+def init_db() -> None:
+    """
+    Створює нові таблиці для статистики/адвокатів/прив'язок.
+    Старі таблиці НЕ чіпає, тому конфліктів не буде.
+    """
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            # 1) Події (аналітика) — тільки хеші
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {T_EVENTS} (
+                    id BIGSERIAL PRIMARY KEY,
+                    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    user_hash TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    category TEXT
+                );
+            """)
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_ts ON {T_EVENTS}(ts);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_event ON {T_EVENTS}(event);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_user_hash ON {T_EVENTS}(user_hash);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_category ON {T_EVENTS}(category);")
 
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_ts ON events_v2(ts);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_event ON events_v2(event);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_user_hash ON events_v2(user_hash);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_events_v2_chat_hash ON events_v2(chat_hash);")
+            # 2) Прив'язки адвокатів: category -> chat_id
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {T_LAWYERS} (
+                    category TEXT PRIMARY KEY,
+                    lawyer_chat_id BIGINT NOT NULL,
+                    updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
 
-            conn.commit()
+            # 3) Pending bind (адмін підтверджує токен)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {T_PENDING} (
+                    token TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    lawyer_chat_id BIGINT NOT NULL,
+                    lawyer_user_id BIGINT NOT NULL,
+                    created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_PENDING}_created ON {T_PENDING}(created_ts);")
 
-    def log_event(self, event: str, meta: dict | None = None, *, user_id=None, chat_id=None):
-        meta = meta or {}
-        uhash = self._hash_id(user_id)
-        chash = self._hash_id(chat_id)
+        conn.commit()
 
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO events_v2 (ts, user_hash, chat_hash, event, meta)
-                    VALUES (NOW(), %s, %s, %s, %s::jsonb);
-                    """,
-                    (uhash, chash, event, json.dumps(meta, ensure_ascii=False)),
-                )
-            conn.commit()
 
-    def log_event_from_update(self, update, event: str, meta: dict | None = None):
-        user_id = None
-        chat_id = None
+def add_event(u_hash: str, event: str, category: str | None = None) -> None:
+    """
+    Додає подію в аналітику (без персональних даних).
+    """
+    if not u_hash:
+        return
+    event = (event or "").strip()
+    if not event:
+        return
 
-        try:
-            if update is not None and getattr(update, "effective_user", None):
-                user_id = update.effective_user.id
-        except Exception:
-            user_id = None
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {T_EVENTS} (ts, user_hash, event, category) VALUES (NOW(), %s, %s, %s);",
+                (u_hash, event, category),
+            )
+        conn.commit()
 
-        try:
-            if update is not None and getattr(update, "effective_chat", None):
-                chat_id = update.effective_chat.id
-        except Exception:
-            chat_id = None
 
-        self.log_event(event, meta or {}, user_id=user_id, chat_id=chat_id)
+def set_lawyer(category: str, lawyer_chat_id: int) -> None:
+    category = (category or "").strip().upper()
+    if not category:
+        return
 
-    def get_lifetime_stats(self) -> dict:
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM events_v2;")
-                total_events = int(cur.fetchone()[0])
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {T_LAWERS} (category, lawyer_chat_id, updated_ts)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (category)
+                DO UPDATE SET lawyer_chat_id=EXCLUDED.lawyer_chat_id,
+                              updated_ts=NOW();
+                """.replace("{T_LAWERS}", T_LAWYERS),  # safe replace
+                (category, int(lawyer_chat_id)),
+            )
+        conn.commit()
 
-                cur.execute("SELECT COUNT(DISTINCT user_hash) FROM events_v2 WHERE user_hash IS NOT NULL;")
-                unique_users = int(cur.fetchone()[0])
 
-                cur.execute("SELECT COUNT(DISTINCT chat_hash) FROM events_v2 WHERE chat_hash IS NOT NULL;")
-                unique_chats = int(cur.fetchone()[0])
+def get_lawyer(category: str) -> int | None:
+    category = (category or "").strip().upper()
+    if not category:
+        return None
 
-                cur.execute(
-                    """
-                    SELECT event, COUNT(*) as cnt
-                    FROM events_v2
-                    GROUP BY event
-                    ORDER BY cnt DESC
-                    LIMIT 30;
-                    """
-                )
-                top_events = [{"event": r[0], "count": int(r[1])} for r in cur.fetchall()]
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT lawyer_chat_id FROM {T_LAWYERS} WHERE category=%s;", (category,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return int(row["lawyer_chat_id"])
 
-        return {
-            "total_events": total_events,
-            "unique_users": unique_users,
-            "unique_chats": unique_chats,
-            "top_events": top_events,
-        }
+
+def create_pending_bind(token: str, category: str, lawyer_chat_id: int, lawyer_user_id: int) -> None:
+    token = (token or "").strip()
+    category = (category or "").strip().upper()
+    if not token or not category:
+        return
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {T_PENDING}(token, category, lawyer_chat_id, lawyer_user_id, created_ts)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (token) DO NOTHING;
+                """,
+                (token, category, int(lawyer_chat_id), int(lawyer_user_id)),
+            )
+        conn.commit()
+
+
+def get_pending_bind(token: str) -> dict | None:
+    token = (token or "").strip()
+    if not token:
+        return None
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT token, category, lawyer_chat_id, lawyer_user_id FROM {T_PENDING} WHERE token=%s;", (token,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def delete_pending_bind(token: str) -> None:
+    token = (token or "").strip()
+    if not token:
+        return
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM {T_PENDING} WHERE token=%s;", (token,))
+        conn.commit()
+
+
+def get_stats(days: int = 7) -> dict:
+    """
+    Повертає структуру, яку очікує твій stats_cmd у bot.py.
+    """
+    days = int(days) if days else 7
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    out = {
+        "days": days,
+        "unique_users": 0,
+        "asked_question": {},
+        "pick_advocate": {},
+        "request_click": {},
+        "request_sent": {},
+        "lawyer_contact_click": {},
+    }
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            # Унікальні користувачі за період
+            cur.execute(
+                f"SELECT COUNT(DISTINCT user_hash) AS cnt FROM {T_EVENTS} WHERE ts >= %s;",
+                (since,),
+            )
+            out["unique_users"] = int(cur.fetchone()["cnt"] or 0)
+
+            # Аггрегація: event + category
+            cur.execute(
+                f"""
+                SELECT event, category, COUNT(*) AS cnt
+                FROM {T_EVENTS}
+                WHERE ts >= %s
+                GROUP BY event, category;
+                """,
+                (since,),
+            )
+            rows = cur.fetchall()
+
+    # Розкладаємо у словники як у твоєму bot.py
+    for r in rows:
+        ev = r["event"]
+        cat = r["category"] or "UNKNOWN"
+        cnt = int(r["cnt"] or 0)
+
+        if ev == "asked_question":
+            out["asked_question"][cat] = out["asked_question"].get(cat, 0) + cnt
+        elif ev == "pick_advocate":
+            out["pick_advocate"][cat] = out["pick_advocate"].get(cat, 0) + cnt
+        elif ev == "request_click":
+            out["request_click"][cat] = out["request_click"].get(cat, 0) + cnt
+        elif ev == "request_sent":
+            out["request_sent"][cat] = out["request_sent"].get(cat, 0) + cnt
+        elif ev == "lawyer_contact_click":
+            out["lawyer_contact_click"][cat] = out["lawyer_contact_click"].get(cat, 0) + cnt
+
+    return out
