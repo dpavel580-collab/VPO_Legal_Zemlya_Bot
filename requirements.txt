@@ -1,4 +1,4 @@
 python-telegram-bot[webhooks]==22.6
 openai==2.24.0
 python-dotenv==1.2.1
-psycopg[binary]==3.3.3
+psycopg[binary]==3.2.3
