@@ -1,238 +1,144 @@
 import os
 import hashlib
-from datetime import datetime, timedelta, timezone
-
 import psycopg
-from psycopg.rows import dict_row
 
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+ANALYTICS_SALT = os.getenv("ANALYTICS_SALT", "").strip()
 
-# Нові назви таблиць, щоб не конфліктувати зі старими "events"
-T_EVENTS = "events_v3"
-T_LAWYERS = "lawyer_bindings_v1"
-T_PENDING = "pending_binds_v1"
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL")
+if not ANALYTICS_SALT:
+    raise RuntimeError("Missing ANALYTICS_SALT")
 
+# ---------- privacy-safe user hash ----------
+def user_hash(telegram_user_id: int) -> str:
+    raw = f"{ANALYTICS_SALT}:{telegram_user_id}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
-def _db_url() -> str:
-    url = (os.getenv("DATABASE_URL", "") or "").strip()
-    if not url:
-        raise RuntimeError("Missing DATABASE_URL (Render Postgres connection string)")
-    return url
-
-
-def _salt() -> str:
-    s = (os.getenv("ANALYTICS_SALT", "") or "").strip()
-    if not s:
-        raise RuntimeError("Missing ANALYTICS_SALT")
-    return s
-
-
-def user_hash(user_id: int | str | None) -> str:
-    """
-    Анонімний стабільний хеш для статистики.
-    НЕ зберігаємо персональні дані.
-    """
-    base = f"{_salt()}:{user_id if user_id is not None else 'unknown'}"
-    return hashlib.sha256(base.encode("utf-8")).hexdigest()
-
-
-def _connect():
-    return psycopg.connect(_db_url(), row_factory=dict_row)
-
-
+# ---------- schema ----------
 def init_db() -> None:
-    """
-    Створює нові таблиці для статистики/адвокатів/прив'язок.
-    Старі таблиці НЕ чіпає, тому конфліктів не буде.
-    """
-    with _connect() as conn:
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            # 1) Події (аналітика) — тільки хеші
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {T_EVENTS} (
-                    id BIGSERIAL PRIMARY KEY,
-                    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    user_hash TEXT NOT NULL,
-                    event TEXT NOT NULL,
-                    category TEXT
-                );
+            # events: only anonymized stats
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id BIGSERIAL PRIMARY KEY,
+                ts TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc'),
+                user_hash TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                category TEXT NOT NULL
+            );
             """)
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_ts ON {T_EVENTS}(ts);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_event ON {T_EVENTS}(event);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_user_hash ON {T_EVENTS}(user_hash);")
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_EVENTS}_category ON {T_EVENTS}(category);")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);""")
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_events_type_cat ON events(event_type, category);""")
 
-            # 2) Прив'язки адвокатів: category -> chat_id
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {T_LAWYERS} (
-                    category TEXT PRIMARY KEY,
-                    lawyer_chat_id BIGINT NOT NULL,
-                    updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
+            # lawyer bindings: category -> chat_id
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS lawyer_bindings (
+                category TEXT PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
+            );
             """)
 
-            # 3) Pending bind (адмін підтверджує токен)
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {T_PENDING} (
-                    token TEXT PRIMARY KEY,
-                    category TEXT NOT NULL,
-                    lawyer_chat_id BIGINT NOT NULL,
-                    lawyer_user_id BIGINT NOT NULL,
-                    created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
+            # pending binds: token -> lawyer chat_id (expires by cleanup)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_binds (
+                token TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                lawyer_chat_id BIGINT NOT NULL,
+                lawyer_user_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
+            );
             """)
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{T_PENDING}_created ON {T_PENDING}(created_ts);")
-
+            cur.execute("""CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_binds(created_at);""")
         conn.commit()
 
-
-def add_event(u_hash: str, event: str, category: str | None = None) -> None:
-    """
-    Додає подію в аналітику (без персональних даних).
-    """
-    if not u_hash:
-        return
-    event = (event or "").strip()
-    if not event:
-        return
-
-    with _connect() as conn:
+# ---------- events ----------
+def add_event(u_hash: str, event_type: str, category: str) -> None:
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                f"INSERT INTO {T_EVENTS} (ts, user_hash, event, category) VALUES (NOW(), %s, %s, %s);",
-                (u_hash, event, category),
+                "INSERT INTO events(user_hash, event_type, category) VALUES (%s, %s, %s);",
+                (u_hash, event_type, category)
             )
         conn.commit()
 
-
-def set_lawyer(category: str, lawyer_chat_id: int) -> None:
-    category = (category or "").strip().upper()
-    if not category:
-        return
-
-    with _connect() as conn:
+def get_stats(days: int = 7) -> dict:
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {T_LAWERS} (category, lawyer_chat_id, updated_ts)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (category)
-                DO UPDATE SET lawyer_chat_id=EXCLUDED.lawyer_chat_id,
-                              updated_ts=NOW();
-                """.replace("{T_LAWERS}", T_LAWYERS),  # safe replace
-                (category, int(lawyer_chat_id)),
-            )
+            cur.execute("""
+            SELECT COUNT(DISTINCT user_hash)
+            FROM events
+            WHERE ts >= (NOW() AT TIME ZONE 'utc') - (%s || ' days')::interval;
+            """, (days,))
+            unique_users = int(cur.fetchone()[0])
+
+            def fetch_map(evtype: str):
+                cur.execute("""
+                SELECT category, COUNT(*)
+                FROM events
+                WHERE ts >= (NOW() AT TIME ZONE 'utc') - (%s || ' days')::interval
+                  AND event_type=%s
+                GROUP BY category
+                ORDER BY COUNT(*) DESC;
+                """, (days, evtype))
+                return {k: int(v) for k, v in cur.fetchall()}
+
+            return {
+                "days": days,
+                "unique_users": unique_users,
+                "pick_advocate": fetch_map("pick_advocate"),
+                "request_click": fetch_map("request_click"),
+                "request_sent": fetch_map("request_sent"),
+                "asked_question": fetch_map("asked_question"),
+            }
+
+# ---------- lawyer binding ----------
+def set_lawyer(category: str, chat_id: int) -> None:
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO lawyer_bindings(category, chat_id)
+            VALUES (%s, %s)
+            ON CONFLICT(category)
+            DO UPDATE SET chat_id=EXCLUDED.chat_id, updated_at=(NOW() AT TIME ZONE 'utc');
+            """, (category, chat_id))
         conn.commit()
 
-
-def get_lawyer(category: str) -> int | None:
-    category = (category or "").strip().upper()
-    if not category:
-        return None
-
-    with _connect() as conn:
+def get_lawyer(category: str):
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT lawyer_chat_id FROM {T_LAWYERS} WHERE category=%s;", (category,))
+            cur.execute("SELECT chat_id FROM lawyer_bindings WHERE category=%s;", (category,))
+            row = cur.fetchone()
+            return int(row[0]) if row else None
+
+# ---------- pending binds ----------
+def create_pending_bind(token: str, category: str, lawyer_chat_id: int, lawyer_user_id: int) -> None:
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO pending_binds(token, category, lawyer_chat_id, lawyer_user_id)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT(token) DO NOTHING;
+            """, (token, category, lawyer_chat_id, lawyer_user_id))
+        conn.commit()
+
+def get_pending_bind(token: str):
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT token, category, lawyer_chat_id, lawyer_user_id
+            FROM pending_binds
+            WHERE token=%s;
+            """, (token,))
             row = cur.fetchone()
             if not row:
                 return None
-            return int(row["lawyer_chat_id"])
-
-
-def create_pending_bind(token: str, category: str, lawyer_chat_id: int, lawyer_user_id: int) -> None:
-    token = (token or "").strip()
-    category = (category or "").strip().upper()
-    if not token or not category:
-        return
-
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {T_PENDING}(token, category, lawyer_chat_id, lawyer_user_id, created_ts)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (token) DO NOTHING;
-                """,
-                (token, category, int(lawyer_chat_id), int(lawyer_user_id)),
-            )
-        conn.commit()
-
-
-def get_pending_bind(token: str) -> dict | None:
-    token = (token or "").strip()
-    if not token:
-        return None
-
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT token, category, lawyer_chat_id, lawyer_user_id FROM {T_PENDING} WHERE token=%s;", (token,))
-            row = cur.fetchone()
-            return dict(row) if row else None
-
+            return {"token": row[0], "category": row[1], "lawyer_chat_id": int(row[2]), "lawyer_user_id": int(row[3])}
 
 def delete_pending_bind(token: str) -> None:
-    token = (token or "").strip()
-    if not token:
-        return
-
-    with _connect() as conn:
+    with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute(f"DELETE FROM {T_PENDING} WHERE token=%s;", (token,))
+            cur.execute("DELETE FROM pending_binds WHERE token=%s;", (token,))
         conn.commit()
-
-
-def get_stats(days: int = 7) -> dict:
-    """
-    Повертає структуру, яку очікує твій stats_cmd у bot.py.
-    """
-    days = int(days) if days else 7
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-
-    out = {
-        "days": days,
-        "unique_users": 0,
-        "asked_question": {},
-        "pick_advocate": {},
-        "request_click": {},
-        "request_sent": {},
-        "lawyer_contact_click": {},
-    }
-
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            # Унікальні користувачі за період
-            cur.execute(
-                f"SELECT COUNT(DISTINCT user_hash) AS cnt FROM {T_EVENTS} WHERE ts >= %s;",
-                (since,),
-            )
-            out["unique_users"] = int(cur.fetchone()["cnt"] or 0)
-
-            # Аггрегація: event + category
-            cur.execute(
-                f"""
-                SELECT event, category, COUNT(*) AS cnt
-                FROM {T_EVENTS}
-                WHERE ts >= %s
-                GROUP BY event, category;
-                """,
-                (since,),
-            )
-            rows = cur.fetchall()
-
-    # Розкладаємо у словники як у твоєму bot.py
-    for r in rows:
-        ev = r["event"]
-        cat = r["category"] or "UNKNOWN"
-        cnt = int(r["cnt"] or 0)
-
-        if ev == "asked_question":
-            out["asked_question"][cat] = out["asked_question"].get(cat, 0) + cnt
-        elif ev == "pick_advocate":
-            out["pick_advocate"][cat] = out["pick_advocate"].get(cat, 0) + cnt
-        elif ev == "request_click":
-            out["request_click"][cat] = out["request_click"].get(cat, 0) + cnt
-        elif ev == "request_sent":
-            out["request_sent"][cat] = out["request_sent"].get(cat, 0) + cnt
-        elif ev == "lawyer_contact_click":
-            out["lawyer_contact_click"][cat] = out["lawyer_contact_click"].get(cat, 0) + cnt
-
-    return out
