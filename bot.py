@@ -63,7 +63,8 @@ if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY")
 if not ADMIN_TELEGRAM_ID:
     raise RuntimeError("Missing ADMIN_TELEGRAM_ID")
-if not DATABASE_URL = os.getenv("DATABASE_URL", "").strip():
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 if not ANALYTICS_SALT:
     # не критично, але краще мати
@@ -719,4 +720,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
