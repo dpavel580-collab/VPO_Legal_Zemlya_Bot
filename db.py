@@ -1,144 +1,203 @@
 import os
-import hashlib
 import psycopg
+from datetime import datetime, timezone, timedelta
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-ANALYTICS_SALT = os.getenv("ANALYTICS_SALT", "").strip()
-
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
-if not ANALYTICS_SALT:
-    raise RuntimeError("Missing ANALYTICS_SALT")
 
-# ---------- privacy-safe user hash ----------
-def user_hash(telegram_user_id: int) -> str:
-    raw = f"{ANALYTICS_SALT}:{telegram_user_id}".encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+def _utcnow():
+    return datetime.now(timezone.utc)
 
-# ---------- schema ----------
-def init_db() -> None:
-    with psycopg.connect(DATABASE_URL) as conn:
+def _conn():
+    return psycopg.connect(DATABASE_URL)
+
+def ensure_tables():
+    sql = """
+    CREATE TABLE IF NOT EXISTS analytics_counters (
+        k TEXT PRIMARY KEY,
+        v BIGINT NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS lawyers (
+        category TEXT PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        bound_at TIMESTAMPTZ NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS lawyer_bind_requests (
+        token TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        lawyer_chat_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        status TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_usage (
+        user_id BIGINT PRIMARY KEY,
+        window_start TIMESTAMPTZ NOT NULL,
+        count INT NOT NULL DEFAULT 0,
+        locked_until TIMESTAMPTZ
+    );
+    """
+    with _conn() as conn:
         with conn.cursor() as cur:
-            # events: only anonymized stats
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id BIGSERIAL PRIMARY KEY,
-                ts TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc'),
-                user_hash TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                category TEXT NOT NULL
-            );
-            """)
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);""")
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_events_type_cat ON events(event_type, category);""")
-
-            # lawyer bindings: category -> chat_id
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS lawyer_bindings (
-                category TEXT PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
-            );
-            """)
-
-            # pending binds: token -> lawyer chat_id (expires by cleanup)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS pending_binds (
-                token TEXT PRIMARY KEY,
-                category TEXT NOT NULL,
-                lawyer_chat_id BIGINT NOT NULL,
-                lawyer_user_id BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
-            );
-            """)
-            cur.execute("""CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_binds(created_at);""")
+            cur.execute(sql)
         conn.commit()
 
-# ---------- events ----------
-def add_event(u_hash: str, event_type: str, category: str) -> None:
-    with psycopg.connect(DATABASE_URL) as conn:
+# -------------------------
+# analytics
+# -------------------------
+def inc_counter(k: str, n: int = 1):
+    with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO events(user_hash, event_type, category) VALUES (%s, %s, %s);",
-                (u_hash, event_type, category)
+                """
+                INSERT INTO analytics_counters (k, v) VALUES (%s, %s)
+                ON CONFLICT (k) DO UPDATE SET v = analytics_counters.v + EXCLUDED.v
+                """,
+                (k, n)
             )
         conn.commit()
 
-def get_stats(days: int = 7) -> dict:
-    with psycopg.connect(DATABASE_URL) as conn:
+def get_all_counters():
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            SELECT COUNT(DISTINCT user_hash)
-            FROM events
-            WHERE ts >= (NOW() AT TIME ZONE 'utc') - (%s || ' days')::interval;
-            """, (days,))
-            unique_users = int(cur.fetchone()[0])
+            cur.execute("SELECT k, v FROM analytics_counters ORDER BY v DESC, k ASC")
+            return cur.fetchall()
 
-            def fetch_map(evtype: str):
-                cur.execute("""
-                SELECT category, COUNT(*)
-                FROM events
-                WHERE ts >= (NOW() AT TIME ZONE 'utc') - (%s || ' days')::interval
-                  AND event_type=%s
-                GROUP BY category
-                ORDER BY COUNT(*) DESC;
-                """, (days, evtype))
-                return {k: int(v) for k, v in cur.fetchall()}
-
-            return {
-                "days": days,
-                "unique_users": unique_users,
-                "pick_advocate": fetch_map("pick_advocate"),
-                "request_click": fetch_map("request_click"),
-                "request_sent": fetch_map("request_sent"),
-                "asked_question": fetch_map("asked_question"),
-            }
-
-# ---------- lawyer binding ----------
-def set_lawyer(category: str, chat_id: int) -> None:
-    with psycopg.connect(DATABASE_URL) as conn:
+# -------------------------
+# lawyers bindings
+# -------------------------
+def set_lawyer(category: str, chat_id: int):
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            INSERT INTO lawyer_bindings(category, chat_id)
-            VALUES (%s, %s)
-            ON CONFLICT(category)
-            DO UPDATE SET chat_id=EXCLUDED.chat_id, updated_at=(NOW() AT TIME ZONE 'utc');
-            """, (category, chat_id))
+            cur.execute(
+                """
+                INSERT INTO lawyers (category, chat_id, bound_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (category) DO UPDATE SET chat_id=EXCLUDED.chat_id, bound_at=EXCLUDED.bound_at
+                """,
+                (category, chat_id, _utcnow())
+            )
         conn.commit()
 
-def get_lawyer(category: str):
-    with psycopg.connect(DATABASE_URL) as conn:
+def get_lawyer_chat(category: str):
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT chat_id FROM lawyer_bindings WHERE category=%s;", (category,))
+            cur.execute("SELECT chat_id FROM lawyers WHERE category=%s", (category,))
             row = cur.fetchone()
-            return int(row[0]) if row else None
+            return row[0] if row else None
 
-# ---------- pending binds ----------
-def create_pending_bind(token: str, category: str, lawyer_chat_id: int, lawyer_user_id: int) -> None:
-    with psycopg.connect(DATABASE_URL) as conn:
+def create_bind_request(token: str, category: str, lawyer_chat_id: int):
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            INSERT INTO pending_binds(token, category, lawyer_chat_id, lawyer_user_id)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT(token) DO NOTHING;
-            """, (token, category, lawyer_chat_id, lawyer_user_id))
+            cur.execute(
+                """
+                INSERT INTO lawyer_bind_requests (token, category, lawyer_chat_id, created_at, status)
+                VALUES (%s, %s, %s, %s, 'pending')
+                """,
+                (token, category, lawyer_chat_id, _utcnow())
+            )
         conn.commit()
 
-def get_pending_bind(token: str):
-    with psycopg.connect(DATABASE_URL) as conn:
+def get_bind_request(token: str):
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-            SELECT token, category, lawyer_chat_id, lawyer_user_id
-            FROM pending_binds
-            WHERE token=%s;
-            """, (token,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {"token": row[0], "category": row[1], "lawyer_chat_id": int(row[2]), "lawyer_user_id": int(row[3])}
+            cur.execute(
+                "SELECT token, category, lawyer_chat_id, status FROM lawyer_bind_requests WHERE token=%s",
+                (token,)
+            )
+            return cur.fetchone()
 
-def delete_pending_bind(token: str) -> None:
-    with psycopg.connect(DATABASE_URL) as conn:
+def mark_bind_request(token: str, status: str):
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM pending_binds WHERE token=%s;", (token,))
+            cur.execute(
+                "UPDATE lawyer_bind_requests SET status=%s WHERE token=%s",
+                (status, token)
+            )
         conn.commit()
+
+# -------------------------
+# free usage limit (20/24h)
+# -------------------------
+def get_usage(user_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT window_start, count, locked_until FROM user_usage WHERE user_id=%s",
+                (user_id,)
+            )
+            return cur.fetchone()
+
+def upsert_usage(user_id: int, window_start, count: int, locked_until):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO user_usage (user_id, window_start, count, locked_until)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET window_start=EXCLUDED.window_start,
+                              count=EXCLUDED.count,
+                              locked_until=EXCLUDED.locked_until
+                """,
+                (user_id, window_start, count, locked_until)
+            )
+        conn.commit()
+
+def check_free_limit(user_id: int, max_q: int = 20, window_hours: int = 24):
+    """
+    Returns: (allowed, remaining, locked_until)
+    Does NOT increment. Increment separately after successful AI answer.
+    """
+    now = _utcnow()
+    row = get_usage(user_id)
+
+    if row is None:
+        upsert_usage(user_id, now, 0, None)
+        return True, max_q, None
+
+    window_start, count, locked_until = row
+
+    if locked_until and now < locked_until:
+        return False, 0, locked_until
+
+    # reset if window expired
+    if now - window_start >= timedelta(hours=window_hours):
+        window_start = now
+        count = 0
+        locked_until = None
+        upsert_usage(user_id, window_start, count, locked_until)
+        return True, max_q, None
+
+    remaining = max(0, max_q - count)
+    if remaining <= 0:
+        locked_until = now + timedelta(hours=window_hours)
+        upsert_usage(user_id, window_start, count, locked_until)
+        return False, 0, locked_until
+
+    return True, remaining, None
+
+def increment_after_answer(user_id: int, max_q: int = 20, window_hours: int = 24):
+    now = _utcnow()
+    row = get_usage(user_id)
+    if row is None:
+        upsert_usage(user_id, now, 1, None)
+        return 1
+
+    window_start, count, locked_until = row
+
+    if now - window_start >= timedelta(hours=window_hours):
+        window_start = now
+        count = 0
+        locked_until = None
+
+    count += 1
+
+    if count >= max_q:
+        locked_until = now + timedelta(hours=window_hours)
+
+    upsert_usage(user_id, window_start, count, locked_until)
+    return count
