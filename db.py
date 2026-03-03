@@ -1,5 +1,4 @@
 # db.py
-import os
 import json
 import time
 from contextlib import contextmanager
@@ -14,24 +13,43 @@ def _now_ts() -> int:
 
 class DB:
     def __init__(self, database_url: str):
-        self.database_url = database_url.strip()
+        self.database_url = (database_url or "").strip()
         if not self.database_url:
             raise ValueError("DATABASE_URL is empty")
         self._init_db()
 
     @contextmanager
     def _conn(self):
-        # autocommit True to avoid "idle in transaction"
         con = psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row)
         try:
             yield con
         finally:
             con.close()
 
+    def _table_exists(self, cur, table: str) -> bool:
+        cur.execute(
+            "SELECT to_regclass(%s) AS reg",
+            (table,),
+        )
+        row = cur.fetchone()
+        return bool(row and row["reg"])
+
+    def _column_exists(self, cur, table: str, column: str) -> bool:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = %s AND column_name = %s
+            LIMIT 1
+            """,
+            (table, column),
+        )
+        return cur.fetchone() is not None
+
     def _init_db(self):
         with self._conn() as con:
             with con.cursor() as cur:
-                # events for analytics (NO personal data required)
+                # ---------- EVENTS table: create if not exists ----------
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS events (
                     id BIGSERIAL PRIMARY KEY,
@@ -40,10 +58,31 @@ class DB:
                     meta JSONB NOT NULL DEFAULT '{}'::jsonb
                 );
                 """)
+
+                # ---------- MIGRATION for existing old schema ----------
+                # If old table existed without "event" column -> add it
+                # and give a default value to old rows.
+                if not self._column_exists(cur, "events", "event"):
+                    cur.execute("ALTER TABLE events ADD COLUMN event TEXT;")
+                    # make it NOT NULL safely
+                    cur.execute("UPDATE events SET event = 'unknown' WHERE event IS NULL;")
+                    cur.execute("ALTER TABLE events ALTER COLUMN event SET NOT NULL;")
+
+                # If old table existed without "meta" column -> add it
+                if not self._column_exists(cur, "events", "meta"):
+                    cur.execute("ALTER TABLE events ADD COLUMN meta JSONB NOT NULL DEFAULT '{}'::jsonb;")
+
+                # If old table existed without "ts" column -> add it
+                if not self._column_exists(cur, "events", "ts"):
+                    cur.execute("ALTER TABLE events ADD COLUMN ts BIGINT;")
+                    cur.execute(f"UPDATE events SET ts = {_now_ts()} WHERE ts IS NULL;")
+                    cur.execute("ALTER TABLE events ALTER COLUMN ts SET NOT NULL;")
+
+                # Indexes (after ensuring columns exist)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_events_event ON events(event);")
 
-                # optional: store lawyer bindings (if you use it)
+                # ---------- lawyer bindings ----------
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS lawyer_bindings (
                     category TEXT PRIMARY KEY,
@@ -52,7 +91,7 @@ class DB:
                 );
                 """)
 
-                # optional: bind tokens (approve/reject)
+                # ---------- bind tokens ----------
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS bind_tokens (
                     token TEXT PRIMARY KEY,
@@ -78,7 +117,6 @@ class DB:
                 )
 
     def stats_all_time(self) -> list[dict]:
-        # returns list of {"event": "...", "cnt": N}
         with self._conn() as con:
             with con.cursor() as cur:
                 cur.execute("""
@@ -89,10 +127,9 @@ class DB:
                 """)
                 return cur.fetchall()
 
-    # ---------- lawyer bind flow (optional) ----------
+    # ---------- lawyer bind flow ----------
     def create_bind_token(self, category: str, requester_chat_id: int, requester_user_id: int) -> str:
         token = f"{int(time.time())}{requester_chat_id}{requester_user_id}"
-        # short token (not crypto), good enough for internal flow
         token = str(abs(hash(token)))[:12]
         with self._conn() as con:
             with con.cursor() as cur:
@@ -107,8 +144,7 @@ class DB:
         with self._conn() as con:
             with con.cursor() as cur:
                 cur.execute("SELECT * FROM bind_tokens WHERE token=%s", (token,))
-                row = cur.fetchone()
-                return row
+                return cur.fetchone()
 
     def mark_bind_token(self, token: str, status: str):
         with self._conn() as con:
@@ -131,6 +167,4 @@ class DB:
             with con.cursor() as cur:
                 cur.execute("SELECT lawyer_chat_id FROM lawyer_bindings WHERE category=%s", (category,))
                 row = cur.fetchone()
-                if not row:
-                    return None
-                return int(row["lawyer_chat_id"])
+                return int(row["lawyer_chat_id"]) if row else None
