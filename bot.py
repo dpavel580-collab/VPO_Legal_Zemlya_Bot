@@ -534,13 +534,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         # Формуємо payload адвокату + inline кнопку "зв'язатися"
         client_id = update.effective_user.id
-        client_username = update.effective_user.username or ""
-        client_line = f"@{client_username}" if client_username else "(username відсутній)"
-
+                
         payload = (
             "НОВИЙ ЗАПИТ НА ЗВОРОТНИЙ ЗВ'ЯЗОК\n"
             f"Категорія: {awaiting} - {CAT_LABEL.get(awaiting,'')}\n"
-            f"Клієнт: {client_line}\n"
             f"ID клієнта: {client_id}\n\n"
             f"{text}"
         )
@@ -659,3 +656,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
