@@ -1,6 +1,6 @@
 python-telegram-bot==20.7
-openai==1.23.6
-psycopg[binary]==3.3.3
+openai>=1.23.6,<2
 python-dotenv==1.0.1
-typing-extensions>=4.12.0
 
+# Postgres driver (працює на 3.11 стабільно)
+psycopg[binary]>=3.2.10,<3.3
