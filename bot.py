@@ -602,7 +602,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    resp = client.chat.completions.create(
+     resp = client.chat.completions.create(
     model=MODEL_NAME,
     messages=input_msgs,
     temperature=0.35,
@@ -656,4 +656,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
