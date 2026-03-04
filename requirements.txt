@@ -1,8 +1,4 @@
-pip>=25.0
-setuptools>=70.0
-wheel>=0.43
-
-python-telegram-bot[webhooks]==20.7
+python-telegram-bot==20.3
 openai==1.23.6
 psycopg[binary]
 python-dotenv==1.0.1
