@@ -1,5 +1,6 @@
 import os
 import logging
+import hashlib
 from typing import Any, Dict, Optional
 
 import psycopg
@@ -8,9 +9,18 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+HASH_SALT = os.getenv("HASH_SALT", "").strip()  # можна не ставити, але бажано
 
-# кешимо назву колонки події, щоб не робити "перевірку" на кожен клік
+# кешимо назву колонки події, щоб не робити перевірку щоразу
 _EVENT_COL: Optional[str] = None
+
+
+def user_hash(user_id: Optional[int]) -> str:
+    """
+    bot.py це імпортує. Повертає стабільний хеш користувача.
+    """
+    base = f"{user_id or 0}:{HASH_SALT}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
 
 def _db_available() -> bool:
@@ -19,19 +29,19 @@ def _db_available() -> bool:
 
 def init_db() -> None:
     """
-    НІЧОГО не створюємо і не мігруємо, щоб не чіпати твою БД.
-    Лише визначимо, як називається колонка події: event_type або event.
+    Нічого не створюємо і не мігруємо.
+    Лише визначаємо, як у твоїй таблиці називається колонка події: event_type або event.
     """
     global _EVENT_COL
 
     if not _db_available():
-        logger.warning("DATABASE_URL is not set. DB stats disabled.")
+        logger.warning("DATABASE_URL is not set. DB disabled.")
+        _EVENT_COL = None
         return
 
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                # пробуємо event_type
                 try:
                     cur.execute("SELECT event_type FROM events LIMIT 1;")
                     _EVENT_COL = "event_type"
@@ -46,25 +56,19 @@ def init_db() -> None:
         _EVENT_COL = None
 
 
-def add_event(
-    u_hash: str,
-    event_type: Optional[str],
-    category: Optional[str],
-    meta: Optional[Dict[str, Any]] = None,
-) -> None:
+def add_event(u_hash: str, event_type: Optional[str], category: Optional[str]) -> None:
     """
-    Пише подію в БД і НІКОЛИ не ламає бота.
+    Пише подію в events.
+    ГОЛОВНЕ: не допускає NULL у critical полях і НІКОЛИ не валить бота.
     """
     global _EVENT_COL
 
     if not _db_available():
         return
 
-    # захист від NULL — саме це у тебе і валить таблицю
     safe_event = (event_type or "").strip() or "unknown"
     safe_cat = (category or "").strip() or "UNKNOWN"
 
-    # якщо ще не визначили колонку — визначимо
     if _EVENT_COL is None:
         init_db()
 
@@ -91,7 +95,7 @@ def add_event(
 
 def get_stats(days: int = 7) -> dict:
     """
-    Статистика. Якщо щось не так — повертає порожнє, бот живий.
+    Статистика. Якщо БД/схема не готова — повертає пусте, бот живий.
     """
     global _EVENT_COL
 
