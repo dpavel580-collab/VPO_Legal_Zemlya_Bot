@@ -59,8 +59,8 @@ def add_event(u_hash: str, event_type: str, category: str) -> None:
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO events(user_hash, event_type, category) VALUES (%s, %s, %s);",
-                (u_hash, event_type, category)
+    "INSERT INTO events(user_hash, event, category) VALUES (%s, %s, %s);",
+    (u_hash, event_type, category)
             )
         conn.commit()
 
