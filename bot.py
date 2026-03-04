@@ -161,7 +161,7 @@ ABOUT_TEXT = (
     "- Бот не є адвокатом і не замінює індивідуальну правову допомогу.\n"
     "- Відповіді мають інформаційний характер.\n"
     "- У складних випадках рекомендується звернутися до адвоката.\n\n"
-    "Проєкт реалізується в рамках програми \"Є-ЗЕМЛЯ\" Асоціацією розвитку та реконструкції регіонів України."
+    "Проєкт реалізується в рамках програми \"Є-ЗЕМЛЯ\" Асоціаціацією розвитку та реконструкції регіонів України."
 )
 
 ASK_HINT_FIRST = (
@@ -600,18 +600,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     input_msgs = [{"role": "system", "content": SYSTEM_PROMPT_BASE}] + context.user_data[HISTORY]
 
     try:
-      await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING
-      )
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING
+        )
 
-      resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=input_msgs,
-        temperature=0.35,
-      )
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=input_msgs,
+            temperature=0.35,
+        )
 
-      answer = sanitize_answer((resp.choices[0].message.content or "").strip())
+        answer = sanitize_answer((resp.choices[0].message.content or "").strip())
         if not answer:
             answer = "Не вийшло сформувати відповідь. Спробуйте переформулювати питання."
 
@@ -659,8 +659,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
