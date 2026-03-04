@@ -442,14 +442,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Надсилаємо адвокату посилання для відкриття приватного чату
     # tg://user?id=... працює в Telegram-клієнтах
+    # Надсилаємо адвокату посилання для відкриття приватного чату
+    try:
+        user = await context.bot.get_chat(client_id)
+        username = user.username
+    except:
+        username = None
+
+    username_line = f"@{username}" if username else "(username відсутній)"
+
     link = f"tg://user?id={client_id}"
+
     msg = (
         "ЗВ'ЯЗОК З КЛІЄНТОМ\n"
-        f"Категорія: {cat} ({CAT_LABEL.get(cat,'')})\n\n"
-        f"Натисніть посилання, щоб відкрити приватний чат:\n{link}\n\n"
+        f"Категорія: {cat} ({CAT_LABEL.get(cat,'')})\n"
+        f"Username: {username_line}\n"
+        f"ID клієнта: {client_id}\n\n"
+        f"Відкрити приватний чат:\n{link}\n\n"
         "Якщо посилання не відкривається, клієнт міг обмежити приватні повідомлення. "
         "Тоді попросіть клієнта написати вам напряму або використайте номер телефону з заявки."
     )
+
     await context.bot.send_message(chat_id=q.message.chat_id, text=msg)
 
 # ----------------------------
@@ -656,4 +669,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
