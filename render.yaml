@@ -1,8 +1,10 @@
 services:
-  - type: web
-    name: VPO_Legal_Zemlya_Bot
+  - type: worker
+    name: vpo-legal-bot
     env: python
     plan: free
-    buildCommand: pip install --no-cache-dir -r requirements.txt
-    startCommand: python bot.py
-    runtime: python-3.11.9
+    buildCommand: "pip install --no-cache-dir -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
