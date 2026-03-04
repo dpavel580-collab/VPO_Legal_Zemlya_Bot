@@ -1,7 +1,7 @@
 import os
 import logging
 import hashlib
-from typing import Any, Dict, Optional
+from typing import Optional, Dict, Any
 
 import psycopg
 
@@ -9,16 +9,14 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-HASH_SALT = os.getenv("HASH_SALT", "").strip()  # можна не ставити, але бажано
+HASH_SALT = os.getenv("HASH_SALT", "").strip()
 
-# кешимо назву колонки події, щоб не робити перевірку щоразу
-_EVENT_COL: Optional[str] = None
+_EVENT_COL: Optional[str] = None  # event_type або event
 
+
+# ----------------- users / hashing -----------------
 
 def user_hash(user_id: Optional[int]) -> str:
-    """
-    bot.py це імпортує. Повертає стабільний хеш користувача.
-    """
     base = f"{user_id or 0}:{HASH_SALT}"
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
@@ -27,10 +25,14 @@ def _db_available() -> bool:
     return bool(DATABASE_URL)
 
 
+# ----------------- init -----------------
+
 def init_db() -> None:
     """
-    Нічого не створюємо і не мігруємо.
-    Лише визначаємо, як у твоїй таблиці називається колонка події: event_type або event.
+    Нічого не мігрує.
+    1) Визначає, як називається колонка події в events: event_type або event.
+    2) Гарантує існування таблиці user_state (для вибору адвоката/стану).
+       Якщо таблиця вже є — просто ок.
     """
     global _EVENT_COL
 
@@ -42,24 +44,42 @@ def init_db() -> None:
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
+                # визначаємо колонку в events
                 try:
                     cur.execute("SELECT event_type FROM events LIMIT 1;")
                     _EVENT_COL = "event_type"
                 except Exception:
                     conn.rollback()
-                    cur.execute("SELECT event FROM events LIMIT 1;")
-                    _EVENT_COL = "event"
+                    try:
+                        cur.execute("SELECT event FROM events LIMIT 1;")
+                        _EVENT_COL = "event"
+                    except Exception:
+                        conn.rollback()
+                        _EVENT_COL = None
 
-        logger.info("DB ok. Using events.%s", _EVENT_COL)
+                # таблиця стану користувача (для адвокатів/кнопок)
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_state (
+                    user_hash TEXT PRIMARY KEY,
+                    lawyer_id TEXT,
+                    state TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """)
+
+            conn.commit()
+
+        logger.info("DB ok. events column=%s", _EVENT_COL)
     except Exception as e:
         logger.exception("init_db failed (ignored): %s", e)
         _EVENT_COL = None
 
 
+# ----------------- events -----------------
+
 def add_event(u_hash: str, event_type: Optional[str], category: Optional[str]) -> None:
     """
-    Пише подію в events.
-    ГОЛОВНЕ: не допускає NULL у critical полях і НІКОЛИ не валить бота.
+    Пише подію в events. Ніколи не валить бота.
     """
     global _EVENT_COL
 
@@ -86,7 +106,7 @@ def add_event(u_hash: str, event_type: Optional[str], category: Optional[str]) -
                         (u_hash, safe_event, safe_cat),
                     )
                 else:
-                    # якщо не змогли визначити схему — просто не пишемо
+                    # якщо events нема/інша схема — просто не пишемо
                     return
             conn.commit()
     except Exception as e:
@@ -94,11 +114,6 @@ def add_event(u_hash: str, event_type: Optional[str], category: Optional[str]) -
 
 
 def get_stats(days: int = 7) -> dict:
-    """
-    Статистика. Якщо БД/схема не готова — повертає пусте, бот живий.
-    """
-    global _EVENT_COL
-
     empty = {
         "days": days,
         "unique_users": 0,
@@ -111,6 +126,7 @@ def get_stats(days: int = 7) -> dict:
     if not _db_available():
         return empty
 
+    global _EVENT_COL
     if _EVENT_COL is None:
         init_db()
         if _EVENT_COL is None:
@@ -154,3 +170,90 @@ def get_stats(days: int = 7) -> dict:
     except Exception as e:
         logger.exception("get_stats failed (ignored): %s", e)
         return empty
+
+
+# ----------------- lawyer selection / user state -----------------
+
+def set_lawyer(u_hash: str, lawyer_id: Optional[str]) -> None:
+    """
+    bot.py імпортує це.
+    Запам'ятовує вибраного адвоката для користувача.
+    """
+    if not _db_available():
+        return
+
+    if not u_hash:
+        return
+
+    if lawyer_id is not None:
+        lawyer_id = str(lawyer_id).strip() or None
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                INSERT INTO user_state(user_hash, lawyer_id, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (user_hash)
+                DO UPDATE SET lawyer_id = EXCLUDED.lawyer_id, updated_at = NOW();
+                """, (u_hash, lawyer_id))
+            conn.commit()
+    except Exception as e:
+        logger.exception("set_lawyer failed (ignored): %s", e)
+
+
+def get_lawyer(u_hash: str) -> Optional[str]:
+    """
+    Допоміжне: дістати адвоката, якщо bot.py це використовує.
+    """
+    if not _db_available():
+        return None
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT lawyer_id FROM user_state WHERE user_hash=%s;", (u_hash,))
+                row = cur.fetchone()
+                return (row[0] if row else None)
+    except Exception as e:
+        logger.exception("get_lawyer failed (ignored): %s", e)
+        return None
+
+
+def set_state(u_hash: str, state: Optional[str]) -> None:
+    """
+    Якщо bot.py веде діалог станами — це теж стане в пригоді.
+    """
+    if not _db_available():
+        return
+
+    if state is not None:
+        state = str(state).strip() or None
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                INSERT INTO user_state(user_hash, state, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (user_hash)
+                DO UPDATE SET state = EXCLUDED.state, updated_at = NOW();
+                """, (u_hash, state))
+            conn.commit()
+    except Exception as e:
+        logger.exception("set_state failed (ignored): %s", e)
+
+
+def get_state(u_hash: str) -> Optional[str]:
+    if not _db_available():
+        return None
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT state FROM user_state WHERE user_hash=%s;", (u_hash,))
+                row = cur.fetchone()
+                return (row[0] if row else None)
+    except Exception as e:
+        logger.exception("get_state failed (ignored): %s", e)
+        return None
