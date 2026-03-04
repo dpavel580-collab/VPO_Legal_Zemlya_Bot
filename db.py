@@ -1,69 +1,44 @@
-# db.py
 import os
 import hashlib
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 import psycopg
-from psycopg.rows import dict_row
 
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+ANALYTICS_SALT = os.getenv("ANALYTICS_SALT", "").strip()
+
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
+if not ANALYTICS_SALT:
+    raise RuntimeError("Missing ANALYTICS_SALT")
 
 
-# ----------------------------
-# helpers
-# ----------------------------
-_EVENT_COL_CACHE: Optional[str] = None
+# ---------- privacy-safe user hash ----------
+def user_hash(telegram_user_id: int) -> str:
+    raw = f"{ANALYTICS_SALT}:{telegram_user_id}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
-def _get_event_col(conn) -> str:
-    """
-    Detects whether events table uses column 'event_type' or 'event'.
-    Caches result.
-    """
-    global _EVENT_COL_CACHE
-    if _EVENT_COL_CACHE:
-        return _EVENT_COL_CACHE
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema='public'
-              AND table_name='events'
-              AND column_name IN ('event_type', 'event')
-            ORDER BY CASE column_name WHEN 'event_type' THEN 0 ELSE 1 END
-            LIMIT 1;
-            """
-        )
-        row = cur.fetchone()
-
-    # Default to event_type if not found (we will create table with event_type in init_db)
-    _EVENT_COL_CACHE = (row[0] if row else "event_type")
-    return _EVENT_COL_CACHE
+# ---------- helpers ----------
+def _col_exists(cur, table: str, col: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name=%s AND column_name=%s
+        LIMIT 1;
+        """,
+        (table, col),
+    )
+    return cur.fetchone() is not None
 
 
-def user_hash(tg_user_id: int) -> str:
-    """
-    Stable user hash to avoid storing raw telegram IDs.
-    """
-    s = str(tg_user_id).encode("utf-8")
-    return hashlib.sha256(s).hexdigest()
-
-
-# ----------------------------
-# DB init / migrations
-# ----------------------------
+# ---------- schema + migrations ----------
 def init_db() -> None:
-    """
-    Creates required tables if they do not exist.
-    Does NOT drop anything.
-    """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            # events: store bot analytics
+            # 1) Ensure tables exist (fresh install)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -71,86 +46,93 @@ def init_db() -> None:
                     ts TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc'),
                     user_hash TEXT NOT NULL,
                     event_type TEXT NOT NULL,
-                    category TEXT,
-                    meta JSONB NOT NULL DEFAULT '{}'::jsonb
+                    category TEXT NOT NULL
                 );
                 """
             )
 
-            # lawyers: mapping category -> contacts string (or any payload you want)
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS lawyers (
+                CREATE TABLE IF NOT EXISTS lawyer_bindings (
                     category TEXT PRIMARY KEY,
-                    contact TEXT NOT NULL,
+                    chat_id BIGINT NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
                 );
                 """
             )
 
-            # pending binds: temporary token -> (category, contact)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pending_binds (
                     token TEXT PRIMARY KEY,
-                    category TEXT,
-                    contact TEXT,
+                    category TEXT NOT NULL,
+                    lawyer_chat_id BIGINT NOT NULL,
+                    lawyer_user_id BIGINT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc')
                 );
                 """
             )
 
+            # 2) Migrate "bad" historical schemas for events
+            # Sometimes older code used column name `event` instead of `event_type`.
+            if _col_exists(cur, "events", "event") and not _col_exists(cur, "events", "event_type"):
+                cur.execute('ALTER TABLE events RENAME COLUMN "event" TO event_type;')
+
+            # Ensure required columns exist
+            if not _col_exists(cur, "events", "event_type"):
+                cur.execute("ALTER TABLE events ADD COLUMN event_type TEXT;")
+
+            if not _col_exists(cur, "events", "category"):
+                cur.execute("ALTER TABLE events ADD COLUMN category TEXT;")
+
+            if not _col_exists(cur, "events", "user_hash"):
+                cur.execute("ALTER TABLE events ADD COLUMN user_hash TEXT;")
+
+            if not _col_exists(cur, "events", "ts"):
+                cur.execute(
+                    "ALTER TABLE events ADD COLUMN ts TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'utc');"
+                )
+
+            # Fix possible NULLs from earlier broken inserts
+            cur.execute("UPDATE events SET event_type='unknown' WHERE event_type IS NULL;")
+            cur.execute("UPDATE events SET category='UNKNOWN' WHERE category IS NULL;")
+            cur.execute("UPDATE events SET user_hash='unknown' WHERE user_hash IS NULL;")
+
+            # Enforce NOT NULL (if column was added without constraints)
+            # This can fail if there are still NULLs; we updated them above.
+            cur.execute("ALTER TABLE events ALTER COLUMN event_type SET NOT NULL;")
+            cur.execute("ALTER TABLE events ALTER COLUMN category SET NOT NULL;")
+            cur.execute("ALTER TABLE events ALTER COLUMN user_hash SET NOT NULL;")
+
+            # 3) Indexes
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_events_type_cat ON events(event_type, category);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_binds(created_at);")
+
         conn.commit()
 
-    # reset cache after possible table creation
-    global _EVENT_COL_CACHE
-    _EVENT_COL_CACHE = None
 
-
-# ----------------------------
-# events
-# ----------------------------
-def add_event(u_hash: str, event_type: str, category: str, meta: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Inserts analytics event.
-    Compatible with DB schemas that may use 'event_type' or 'event' column name.
-    """
-    meta = meta or {}
+# ---------- events ----------
+def add_event(u_hash: str, event_type: str, category: str) -> None:
+    # Hard safety: never allow null/empty to crash inserts
+    u_hash = (u_hash or "unknown").strip()
+    event_type = (event_type or "unknown").strip()
+    category = (category or "UNKNOWN").strip()
 
     with psycopg.connect(DATABASE_URL) as conn:
-        ev_col = _get_event_col(conn)
-        with conn.cursor() as cur:
-            if ev_col == "event_type":
-                cur.execute(
-                    """
-                    INSERT INTO events(user_hash, event_type, category, meta)
-                    VALUES (%s, %s, %s, %s::jsonb);
-                    """,
-                    (u_hash, event_type, category, psycopg.types.json.Json(meta)),
-                )
-            else:
-                # legacy schema with 'event' column
-                cur.execute(
-                    """
-                    INSERT INTO events(user_hash, event, category, meta)
-                    VALUES (%s, %s, %s, %s::jsonb);
-                    """,
-                    (u_hash, event_type, category, psycopg.types.json.Json(meta)),
-                )
-        conn.commit()
-
-
-def get_stats(days: int = 7) -> dict:
-    """
-    Returns:
-      unique_users
-      pick_advocate/request_click/request_sent/asked_question maps by category
-    """
-    with psycopg.connect(DATABASE_URL) as conn:
-        ev_col = _get_event_col(conn)
         with conn.cursor() as cur:
             cur.execute(
-                f"""
+                "INSERT INTO events(user_hash, event_type, category) VALUES (%s, %s, %s);",
+                (u_hash, event_type, category),
+            )
+        conn.commit()
+
+
+def get_stats(days: int = 7) -> Dict[str, Any]:
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
                 SELECT COUNT(DISTINCT user_hash)
                 FROM events
                 WHERE ts >= (NOW() AT TIME ZONE 'utc') - (%s || ' days')::interval;
@@ -161,17 +143,17 @@ def get_stats(days: int = 7) -> dict:
 
             def fetch_map(evtype: str) -> Dict[str, int]:
                 cur.execute(
-                    f"""
-                    SELECT COALESCE(category, 'UNKNOWN') AS category, COUNT(*)::int
+                    """
+                    SELECT category, COUNT(*)
                     FROM events
                     WHERE ts >= (NOW() AT TIME ZONE 'utc') - (%s || ' days')::interval
-                      AND {ev_col} = %s
-                    GROUP BY COALESCE(category, 'UNKNOWN')
+                      AND event_type=%s
+                    GROUP BY category
                     ORDER BY COUNT(*) DESC;
                     """,
                     (days, evtype),
                 )
-                return {k: int(v) for (k, v) in cur.fetchall()}
+                return {k: int(v) for k, v in cur.fetchall()}
 
             return {
                 "days": days,
@@ -183,111 +165,68 @@ def get_stats(days: int = 7) -> dict:
             }
 
 
-# ----------------------------
-# lawyers (category -> contact)
-# ----------------------------
-def set_lawyer(category: str, contact: str) -> None:
-    """
-    Stores/updates lawyer contact for a category.
-    """
-    category = (category or "").strip()
-    contact = (contact or "").strip()
-    if not category:
-        raise ValueError("category is required")
-    if not contact:
-        raise ValueError("contact is required")
-
+# ---------- lawyer binding ----------
+def set_lawyer(category: str, chat_id: int) -> None:
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO lawyers(category, contact)
+                INSERT INTO lawyer_bindings(category, chat_id)
                 VALUES (%s, %s)
-                ON CONFLICT (category)
-                DO UPDATE SET contact = EXCLUDED.contact,
-                              updated_at = (NOW() AT TIME ZONE 'utc');
+                ON CONFLICT(category)
+                DO UPDATE SET chat_id=EXCLUDED.chat_id, updated_at=(NOW() AT TIME ZONE 'utc');
                 """,
-                (category, contact),
+                (category, chat_id),
             )
         conn.commit()
 
 
-def get_lawyer(category: str) -> Optional[str]:
-    """
-    Returns contact string for category or None.
-    """
-    category = (category or "").strip()
-    if not category:
-        return None
-
+def get_lawyer(category: str) -> Optional[int]:
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT contact FROM lawyers WHERE category=%s;",
-                (category,),
-            )
+            cur.execute("SELECT chat_id FROM lawyer_bindings WHERE category=%s;", (category,))
             row = cur.fetchone()
-            return (row[0] if row else None)
+            return int(row[0]) if row else None
 
 
-# ----------------------------
-# pending binds (token -> category/contact)
-# ----------------------------
-def create_pending_bind(token: str, category: Optional[str] = None, contact: Optional[str] = None) -> None:
-    """
-    Creates/overwrites pending bind token.
-    bot.py may call it with 1..3 args, so we keep category/contact optional.
-    """
-    token = (token or "").strip()
-    if not token:
-        raise ValueError("token is required")
-
-    category = (category or "").strip() if category is not None else None
-    contact = (contact or "").strip() if contact is not None else None
-
+# ---------- pending binds ----------
+def create_pending_bind(token: str, category: str, lawyer_chat_id: int, lawyer_user_id: int) -> None:
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO pending_binds(token, category, contact)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (token)
-                DO UPDATE SET category = EXCLUDED.category,
-                              contact = EXCLUDED.contact,
-                              created_at = (NOW() AT TIME ZONE 'utc');
+                INSERT INTO pending_binds(token, category, lawyer_chat_id, lawyer_user_id)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT(token) DO NOTHING;
                 """,
-                (token, category, contact),
+                (token, category, lawyer_chat_id, lawyer_user_id),
             )
         conn.commit()
 
 
 def get_pending_bind(token: str) -> Optional[Dict[str, Any]]:
-    """
-    Returns dict: {token, category, contact, created_at} or None
-    """
-    token = (token or "").strip()
-    if not token:
-        return None
-
     with psycopg.connect(DATABASE_URL) as conn:
-        conn.row_factory = dict_row
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT token, category, contact, created_at FROM pending_binds WHERE token=%s;",
+                """
+                SELECT token, category, lawyer_chat_id, lawyer_user_id
+                FROM pending_binds
+                WHERE token=%s;
+                """,
                 (token,),
             )
             row = cur.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            return {
+                "token": row[0],
+                "category": row[1],
+                "lawyer_chat_id": int(row[2]),
+                "lawyer_user_id": int(row[3]),
+            }
 
 
 def delete_pending_bind(token: str) -> None:
-    """
-    Deletes pending bind token (idempotent).
-    """
-    token = (token or "").strip()
-    if not token:
-        return
-
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM pending_binds WHERE token=%s;", (token,))
