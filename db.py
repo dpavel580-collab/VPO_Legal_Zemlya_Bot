@@ -1,7 +1,9 @@
 import os
 import logging
 import hashlib
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
+from datetime import datetime, timezone
+import uuid
 
 import psycopg
 
@@ -29,10 +31,9 @@ def _db_available() -> bool:
 
 def init_db() -> None:
     """
-    Нічого не мігрує.
-    1) Визначає, як називається колонка події в events: event_type або event.
-    2) Гарантує існування таблиці user_state (для вибору адвоката/стану).
-       Якщо таблиця вже є — просто ок.
+    1) Визначає як називається колонка події в events: event_type або event.
+    2) Створює user_state (вибір адвоката/стан).
+    3) Створює pending_binds (тимчасові "прив'язки" — наприклад для платежів/зв’язку).
     """
     global _EVENT_COL
 
@@ -57,13 +58,24 @@ def init_db() -> None:
                         conn.rollback()
                         _EVENT_COL = None
 
-                # таблиця стану користувача (для адвокатів/кнопок)
+                # таблиця стану користувача
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_state (
                     user_hash TEXT PRIMARY KEY,
                     lawyer_id TEXT,
                     state TEXT,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """)
+
+                # pending binds (тимчасові дані/токени)
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_binds (
+                    token TEXT PRIMARY KEY,
+                    user_hash TEXT NOT NULL,
+                    bind_type TEXT NOT NULL,
+                    payload TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
                 );
                 """)
 
@@ -79,7 +91,7 @@ def init_db() -> None:
 
 def add_event(u_hash: str, event_type: Optional[str], category: Optional[str]) -> None:
     """
-    Пише подію в events. Ніколи не валить бота.
+    Пише подію в events. НІКОЛИ не валить бота.
     """
     global _EVENT_COL
 
@@ -106,7 +118,6 @@ def add_event(u_hash: str, event_type: Optional[str], category: Optional[str]) -
                         (u_hash, safe_event, safe_cat),
                     )
                 else:
-                    # якщо events нема/інша схема — просто не пишемо
                     return
             conn.commit()
     except Exception as e:
@@ -177,16 +188,11 @@ def get_stats(days: int = 7) -> dict:
 def set_lawyer(u_hash: str, lawyer_id: Optional[str]) -> None:
     """
     bot.py імпортує це.
-    Запам'ятовує вибраного адвоката для користувача.
     """
-    if not _db_available():
+    if not _db_available() or not u_hash:
         return
 
-    if not u_hash:
-        return
-
-    if lawyer_id is not None:
-        lawyer_id = str(lawyer_id).strip() or None
+    lawyer_id = (str(lawyer_id).strip() if lawyer_id is not None else None) or None
 
     try:
         with psycopg.connect(DATABASE_URL) as conn:
@@ -203,10 +209,7 @@ def set_lawyer(u_hash: str, lawyer_id: Optional[str]) -> None:
 
 
 def get_lawyer(u_hash: str) -> Optional[str]:
-    """
-    Допоміжне: дістати адвоката, якщо bot.py це використовує.
-    """
-    if not _db_available():
+    if not _db_available() or not u_hash:
         return None
 
     try:
@@ -221,14 +224,10 @@ def get_lawyer(u_hash: str) -> Optional[str]:
 
 
 def set_state(u_hash: str, state: Optional[str]) -> None:
-    """
-    Якщо bot.py веде діалог станами — це теж стане в пригоді.
-    """
-    if not _db_available():
+    if not _db_available() or not u_hash:
         return
 
-    if state is not None:
-        state = str(state).strip() or None
+    state = (str(state).strip() if state is not None else None) or None
 
     try:
         with psycopg.connect(DATABASE_URL) as conn:
@@ -245,7 +244,7 @@ def set_state(u_hash: str, state: Optional[str]) -> None:
 
 
 def get_state(u_hash: str) -> Optional[str]:
-    if not _db_available():
+    if not _db_available() or not u_hash:
         return None
 
     try:
@@ -257,3 +256,93 @@ def get_state(u_hash: str) -> Optional[str]:
     except Exception as e:
         logger.exception("get_state failed (ignored): %s", e)
         return None
+
+
+# ----------------- pending bind -----------------
+
+def create_pending_bind(*args, **kwargs) -> str:
+    """
+    bot.py імпортує це.
+    Зроблено максимально сумісно: приймає будь-які аргументи.
+    Повертає token (рядок).
+    Очікуваний сенс: створити тимчасовий запис прив'язки/платежу/дії.
+    """
+
+    # Спроба витягнути u_hash і bind_type з різних варіантів виклику:
+    u_hash = kwargs.get("u_hash") or kwargs.get("user_hash")
+    bind_type = kwargs.get("bind_type") or kwargs.get("type") or kwargs.get("kind")
+    payload = kwargs.get("payload") or kwargs.get("data")
+
+    # Якщо прийшли позиційні:
+    # варіант 1: (u_hash, bind_type, payload)
+    if len(args) >= 1 and not u_hash:
+        u_hash = args[0]
+    if len(args) >= 2 and not bind_type:
+        bind_type = args[1]
+    if len(args) >= 3 and payload is None:
+        payload = args[2]
+
+    u_hash = (str(u_hash).strip() if u_hash is not None else "") or ""
+    bind_type = (str(bind_type).strip() if bind_type is not None else "") or "generic"
+    payload_str = None if payload is None else str(payload)
+
+    token = uuid.uuid4().hex
+
+    if not _db_available():
+        return token
+
+    try:
+        init_db()
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                INSERT INTO pending_binds(token, user_hash, bind_type, payload)
+                VALUES (%s, %s, %s, %s);
+                """, (token, u_hash, bind_type, payload_str))
+            conn.commit()
+    except Exception as e:
+        logger.exception("create_pending_bind failed (ignored): %s", e)
+
+    return token
+
+
+def get_pending_bind(token: str) -> Optional[Dict[str, Any]]:
+    if not _db_available() or not token:
+        return None
+
+    try:
+        init_db()
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                SELECT token, user_hash, bind_type, payload, created_at
+                FROM pending_binds
+                WHERE token=%s
+                """, (token,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return {
+                    "token": row[0],
+                    "user_hash": row[1],
+                    "bind_type": row[2],
+                    "payload": row[3],
+                    "created_at": row[4].isoformat() if row[4] else None
+                }
+    except Exception as e:
+        logger.exception("get_pending_bind failed (ignored): %s", e)
+        return None
+
+
+def clear_pending_bind(token: str) -> None:
+    if not _db_available() or not token:
+        return
+
+    try:
+        init_db()
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pending_binds WHERE token=%s;", (token,))
+            conn.commit()
+    except Exception as e:
+        logger.exception("clear_pending_bind failed (ignored): %s", e)
