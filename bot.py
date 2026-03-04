@@ -602,13 +602,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-        resp = client.responses.create(
-            model=MODEL_NAME,
-            input=input_msgs,
-            temperature=0.35,
-        )
+    resp = client.chat.completions.create(
+    model=MODEL_NAME,
+    messages=input_msgs,
+    temperature=0.35,
+)
 
-        answer = sanitize_answer((resp.output_text or "").strip())
+        answer = sanitize_answer((resp.choices[0].message.content or "").strip())
         if not answer:
             answer = "Не вийшло сформувати відповідь. Спробуйте переформулювати питання."
 
@@ -656,3 +656,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
